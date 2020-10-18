@@ -1,8 +1,8 @@
 // Package static is a static resolver
-package registry
+package static
 
 import (
-	"github.com/micro/go-micro/network/resolver"
+	"github.com/micro/go-micro/v3/network/resolver"
 )
 
 // Resolver returns a static list of nodes. In the event the node list
@@ -21,7 +21,7 @@ func (r *Resolver) Resolve(name string) ([]*resolver.Record, error) {
 		}, nil
 	}
 
-	var records []*resolver.Record
+	records := make([]*resolver.Record, 0, len(r.Nodes))
 
 	for _, node := range r.Nodes {
 		records = append(records, &resolver.Record{

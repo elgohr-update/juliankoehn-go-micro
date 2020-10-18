@@ -3,65 +3,69 @@ package memory
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/util/log"
+	"github.com/micro/go-micro/v3/logger"
+	"github.com/micro/go-micro/v3/registry"
 )
 
 var (
 	sendEventTime = 10 * time.Millisecond
-	ttlPruneTime  = 1 * time.Minute
-	DefaultTTL    = 1 * time.Minute
+	ttlPruneTime  = time.Second
 )
 
-// node tracks node registration timestamp and TTL
 type node struct {
-	lastSeen time.Time
-	ttl      time.Duration
+	*registry.Node
+	TTL      time.Duration
+	LastSeen time.Time
+}
+
+type record struct {
+	Name      string
+	Version   string
+	Metadata  map[string]string
+	Nodes     map[string]*node
+	Endpoints []*registry.Endpoint
 }
 
 type Registry struct {
 	options registry.Options
 
 	sync.RWMutex
-	Services map[string][]*registry.Service
-	nodes    map[string]*node
-	Watchers map[string]*Watcher
+	// records is a KV map with domain name as the key and a services map as the value
+	records  map[string]services
+	watchers map[string]*Watcher
 }
 
+// services is a KV map with service name as the key and a map of records as the value
+type services map[string]map[string]*record
+
+// NewRegistry returns an initialized in-memory registry
 func NewRegistry(opts ...registry.Option) registry.Registry {
 	options := registry.Options{
 		Context: context.Background(),
 	}
-
 	for _, o := range opts {
 		o(&options)
 	}
 
-	services := getServices(options.Context)
-	if services == nil {
-		services = make(map[string][]*registry.Service)
+	// records can be passed for testing purposes
+	records := getServiceRecords(options.Context)
+	if records == nil {
+		records = make(services)
 	}
 
 	reg := &Registry{
 		options:  options,
-		Services: services,
-		nodes:    make(map[string]*node),
-		Watchers: make(map[string]*Watcher),
+		records:  map[string]services{registry.DefaultDomain: records},
+		watchers: make(map[string]*Watcher),
 	}
 
 	go reg.ttlPrune()
 
 	return reg
-}
-
-// nodeTrackId returns a string we use to track a node of a given service
-func nodeTrackId(svcName, svcVersion, nodeId string) string {
-	return svcName + "+" + svcVersion + "+" + nodeId
 }
 
 func (m *Registry) ttlPrune() {
@@ -72,49 +76,29 @@ func (m *Registry) ttlPrune() {
 		select {
 		case <-prune.C:
 			m.Lock()
-			for nodeTrackId, node := range m.nodes {
-				// if the TTL has been set and we exceed the hresholdset by it we stop tracking the node
-				if node.ttl.Seconds() != 0.0 && time.Since(node.lastSeen) > node.ttl {
-					// split nodeTrackID into service Name, Version and Node Id
-					trackIdSplit := strings.Split(nodeTrackId, "+")
-					svcName, svcVersion, nodeId := trackIdSplit[0], trackIdSplit[1], trackIdSplit[2]
-					log.Debugf("[memory] Registry TTL expired for service %s, node %s", svcName, nodeId)
-					// we need to find a node that expired and delete it from service nodes
-					if _, ok := m.Services[svcName]; ok {
-						for _, service := range m.Services[svcName] {
-							if service.Version != svcVersion {
-								continue
-							}
-							// find expired service node and delete it
-							var nodes []*registry.Node
-							for _, n := range service.Nodes {
-								var del bool
-								if n.Id == nodeId {
-									del = true
+			for domain, services := range m.records {
+				for service, versions := range services {
+					for version, record := range versions {
+						for id, n := range record.Nodes {
+							if n.TTL != 0 && time.Since(n.LastSeen) > n.TTL {
+								if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+									logger.Debugf("Registry TTL expired for node %s of service %s", n.Id, service)
 								}
-								if !del {
-									nodes = append(nodes, n)
-								}
+								delete(m.records[domain][service][version].Nodes, id)
 							}
-							service.Nodes = nodes
 						}
 					}
-					// stop tracking the node
-					delete(m.nodes, nodeTrackId)
 				}
 			}
 			m.Unlock()
 		}
 	}
-
-	return
 }
 
 func (m *Registry) sendEvent(r *registry.Result) {
-	var watchers []*Watcher
-
 	m.RLock()
-	for _, w := range m.Watchers {
+	watchers := make([]*Watcher, 0, len(m.watchers))
+	for _, w := range m.watchers {
 		watchers = append(watchers, w)
 	}
 	m.RUnlock()
@@ -123,7 +107,7 @@ func (m *Registry) sendEvent(r *registry.Result) {
 		select {
 		case <-w.exit:
 			m.Lock()
-			delete(m.Watchers, w.id)
+			delete(m.watchers, w.id)
 			m.Unlock()
 		default:
 			select {
@@ -141,11 +125,32 @@ func (m *Registry) Init(opts ...registry.Option) error {
 
 	// add services
 	m.Lock()
-	for k, v := range getServices(m.options.Context) {
-		s := m.Services[k]
-		m.Services[k] = registry.Merge(s, v)
+	defer m.Unlock()
+
+	// get the existing services from the records
+	srvs, ok := m.records[registry.DefaultDomain]
+	if !ok {
+		srvs = make(services)
 	}
-	m.Unlock()
+
+	// loop through the services and if it doesn't yet exist, add it to the slice. This is used for
+	// testing purposes.
+	for name, record := range getServiceRecords(m.options.Context) {
+		if _, ok := srvs[name]; !ok {
+			srvs[name] = record
+			continue
+		}
+
+		for version, r := range record {
+			if _, ok := srvs[name][version]; !ok {
+				srvs[name][version] = r
+				continue
+			}
+		}
+	}
+
+	// set the services in the registry
+	m.records[registry.DefaultDomain] = srvs
 	return nil
 }
 
@@ -153,168 +158,299 @@ func (m *Registry) Options() registry.Options {
 	return m.options
 }
 
-func (m *Registry) GetService(name string) ([]*registry.Service, error) {
-	m.RLock()
-	service, ok := m.Services[name]
-	m.RUnlock()
-	if !ok {
-		return nil, registry.ErrNotFound
-	}
-
-	return service, nil
-}
-
-func (m *Registry) ListServices() ([]*registry.Service, error) {
-	var services []*registry.Service
-	m.RLock()
-	for _, service := range m.Services {
-		services = append(services, service...)
-	}
-	m.RUnlock()
-	return services, nil
-}
-
 func (m *Registry) Register(s *registry.Service, opts ...registry.RegisterOption) error {
 	m.Lock()
 	defer m.Unlock()
 
-	log.Debugf("[memory] Registry registering service: %s", s.Name)
-
+	// parse the options, fallback to the default domain
 	var options registry.RegisterOptions
 	for _, o := range opts {
 		o(&options)
 	}
+	if len(options.Domain) == 0 {
+		options.Domain = registry.DefaultDomain
+	}
 
-	if service, ok := m.Services[s.Name]; !ok {
-		m.Services[s.Name] = []*registry.Service{s}
-		// add all nodes into nodes map to track their TTL
-		for _, n := range s.Nodes {
-			log.Debugf("[memory] Registry tracking new service: %s, node %s", s.Name, n.Id)
-			m.nodes[nodeTrackId(s.Name, s.Version, n.Id)] = &node{
-				lastSeen: time.Now(),
-				ttl:      options.TTL,
-			}
+	// get the services for this domain from the registry
+	srvs, ok := m.records[options.Domain]
+	if !ok {
+		srvs = make(services)
+	}
+
+	// domain is set in metadata so it can be passed to watchers
+	if s.Metadata == nil {
+		s.Metadata = map[string]string{"domain": options.Domain}
+	} else {
+		s.Metadata["domain"] = options.Domain
+	}
+
+	// ensure the service name exists
+	r := serviceToRecord(s, options.TTL)
+	if _, ok := srvs[s.Name]; !ok {
+		srvs[s.Name] = make(map[string]*record)
+	}
+
+	if _, ok := srvs[s.Name][s.Version]; !ok {
+		srvs[s.Name][s.Version] = r
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Registry added new service: %s, version: %s", s.Name, s.Version)
+		}
+		m.records[options.Domain] = srvs
+		go m.sendEvent(&registry.Result{Action: "create", Service: s})
+	}
+
+	var addedNodes bool
+
+	for _, n := range s.Nodes {
+		// check if already exists
+		if _, ok := srvs[s.Name][s.Version].Nodes[n.Id]; ok {
+			continue
+		}
+
+		metadata := make(map[string]string)
+
+		// make copy of metadata
+		for k, v := range n.Metadata {
+			metadata[k] = v
+		}
+
+		// set the domain
+		metadata["domain"] = options.Domain
+
+		// add the node
+		srvs[s.Name][s.Version].Nodes[n.Id] = &node{
+			Node: &registry.Node{
+				Id:       n.Id,
+				Address:  n.Address,
+				Metadata: metadata,
+			},
+			TTL:      options.TTL,
+			LastSeen: time.Now(),
+		}
+
+		addedNodes = true
+	}
+
+	if addedNodes {
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Registry added new node to service: %s, version: %s", s.Name, s.Version)
 		}
 		go m.sendEvent(&registry.Result{Action: "update", Service: s})
-		return nil
 	} else {
-		// svcCount keeps the count of all versions of particular service
-		//svcCount := len(service)
-		// svcNodes maintains a list of node Ids per particular service version
-		svcNodes := make(map[string]map[string][]string)
-		// collect all service ids for all service versions
-		for _, s := range service {
-			if _, ok := svcNodes[s.Name]; !ok {
-				svcNodes[s.Name] = make(map[string][]string)
+		// refresh TTL and timestamp
+		for _, n := range s.Nodes {
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Updated registration for service: %s, version: %s", s.Name, s.Version)
 			}
-			if _, ok := svcNodes[s.Name][s.Version]; !ok {
-				for _, n := range s.Nodes {
-					svcNodes[s.Name][s.Version] = append(svcNodes[s.Name][s.Version], n.Id)
-				}
-			}
-		}
-		// if merged count and original service counts changed we know we are adding a new version of the service
-		merged := registry.Merge(service, []*registry.Service{s})
-		// if the node count of any service [version] changed we know we are adding a new node to the service
-		for _, s := range merged {
-			// we know that if the node counts have changed we need to track new nodes
-			if len(s.Nodes) != len(svcNodes[s.Name][s.Version]) {
-				for _, n := range s.Nodes {
-					var found bool
-					for _, id := range svcNodes[s.Name][s.Version] {
-						if n.Id == id {
-							found = true
-							break
-						}
-					}
-					if !found {
-						log.Debugf("[memory] Registry tracking new node: %s for service %s", n.Id, s.Name)
-						m.nodes[nodeTrackId(s.Name, s.Version, n.Id)] = &node{
-							lastSeen: time.Now(),
-							ttl:      options.TTL,
-						}
-					}
-				}
-				m.Services[s.Name] = merged
-				go m.sendEvent(&registry.Result{Action: "update", Service: s})
-				return nil
-			}
-			// refresh the timestamp and TTL of the service node
-			for _, n := range s.Nodes {
-				trackId := nodeTrackId(s.Name, s.Version, n.Id)
-				log.Debugf("[memory] Registry refreshing TTL for node %s for service %s", n.Id, s.Name)
-				if trackedNode, ok := m.nodes[trackId]; ok {
-					trackedNode.lastSeen = time.Now()
-					trackedNode.ttl = options.TTL
-				}
-			}
+			srvs[s.Name][s.Version].Nodes[n.Id].TTL = options.TTL
+			srvs[s.Name][s.Version].Nodes[n.Id].LastSeen = time.Now()
 		}
 	}
 
+	m.records[options.Domain] = srvs
 	return nil
 }
 
-func (m *Registry) Deregister(s *registry.Service) error {
+func (m *Registry) Deregister(s *registry.Service, opts ...registry.DeregisterOption) error {
 	m.Lock()
 	defer m.Unlock()
 
-	log.Debugf("[memory] Registry deregistering service: %s", s.Name)
+	// parse the options, fallback to the default domain
+	var options registry.DeregisterOptions
+	for _, o := range opts {
+		o(&options)
+	}
+	if len(options.Domain) == 0 {
+		options.Domain = registry.DefaultDomain
+	}
 
-	if service, ok := m.Services[s.Name]; ok {
-		// svcNodes collects the list of all node Ids for each service version
-		svcNodes := make(map[string]map[string][]string)
-		// collect all service node ids for all service versions
-		for _, svc := range service {
-			if _, ok := svcNodes[svc.Name]; !ok {
-				svcNodes[svc.Name] = make(map[string][]string)
+	// domain is set in metadata so it can be passed to watchers
+	if s.Metadata == nil {
+		s.Metadata = map[string]string{"domain": options.Domain}
+	} else {
+		s.Metadata["domain"] = options.Domain
+	}
+
+	// if the domain doesn't exist, there is nothing to deregister
+	services, ok := m.records[options.Domain]
+	if !ok {
+		return nil
+	}
+
+	// if no services with this name and version exist, there is nothing to deregister
+	versions, ok := services[s.Name]
+	if !ok {
+		return nil
+	}
+
+	version, ok := versions[s.Version]
+	if !ok {
+		return nil
+	}
+
+	// deregister all of the service nodes from this version
+	for _, n := range s.Nodes {
+		if _, ok := version.Nodes[n.Id]; ok {
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Registry removed node from service: %s, version: %s", s.Name, s.Version)
 			}
-			if _, ok := svcNodes[svc.Name][svc.Version]; !ok {
-				for _, n := range svc.Nodes {
-					svcNodes[svc.Name][svc.Version] = append(svcNodes[svc.Name][svc.Version], n.Id)
-				}
-			}
+			delete(version.Nodes, n.Id)
 		}
-		// if there are no more services we know we have either removed all nodes or there were no nodes
-		if updatedService := registry.Remove(service, []*registry.Service{s}); len(updatedService) == 0 {
-			for _, id := range svcNodes[s.Name][s.Version] {
-				log.Debugf("[memory] Registry stopped tracking node %s for service %s", id, s.Name)
-				delete(m.nodes, nodeTrackId(s.Name, s.Version, id))
-				go m.sendEvent(&registry.Result{Action: "delete", Service: s})
-			}
-			log.Debugf("[memory] Registry deleting service %s: no service nodes", s.Name)
-			delete(m.Services, s.Name)
-			return nil
-		} else {
-			// find out which nodes have been removed
-			for _, id := range svcNodes[s.Name][s.Version] {
-				for _, svc := range updatedService {
-					var found bool
-					for _, n := range svc.Nodes {
-						if id == n.Id {
-							found = true
-							break
-						}
-					}
-					if !found {
-						log.Debugf("[memory] Registry stopped tracking node %s for service %s", id, s.Name)
-						delete(m.nodes, nodeTrackId(s.Name, s.Version, id))
-						go m.sendEvent(&registry.Result{Action: "delete", Service: s})
-					}
-				}
-				m.Services[s.Name] = updatedService
-			}
+	}
+
+	// if the nodes not empty, we replace the version in the store and exist, the rest of the logic
+	// is cleanup
+	if len(version.Nodes) > 0 {
+		m.records[options.Domain][s.Name][s.Version] = version
+		go m.sendEvent(&registry.Result{Action: "update", Service: s})
+		return nil
+	}
+
+	// if this version was the only version of the service, we can remove the whole service from the
+	// registry and exit
+	if len(versions) == 1 {
+		delete(m.records[options.Domain], s.Name)
+		go m.sendEvent(&registry.Result{Action: "delete", Service: s})
+
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Registry removed service: %s", s.Name)
 		}
+		return nil
+	}
+
+	// there are other versions of the service running, so only remove this version of it
+	delete(m.records[options.Domain][s.Name], s.Version)
+	go m.sendEvent(&registry.Result{Action: "delete", Service: s})
+	if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+		logger.Debugf("Registry removed service: %s, version: %s", s.Name, s.Version)
 	}
 
 	return nil
 }
 
+func (m *Registry) GetService(name string, opts ...registry.GetOption) ([]*registry.Service, error) {
+	// parse the options, fallback to the default domain
+	var options registry.GetOptions
+	for _, o := range opts {
+		o(&options)
+	}
+	if len(options.Domain) == 0 {
+		options.Domain = registry.DefaultDomain
+	}
+
+	// if it's a wildcard domain, return from all domains
+	if options.Domain == registry.WildcardDomain {
+		m.RLock()
+		recs := m.records
+		m.RUnlock()
+
+		var services []*registry.Service
+
+		for domain := range recs {
+			srvs, err := m.GetService(name, append(opts, registry.GetDomain(domain))...)
+			if err == registry.ErrNotFound {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+			services = append(services, srvs...)
+		}
+
+		if len(services) == 0 {
+			return nil, registry.ErrNotFound
+		}
+		return services, nil
+	}
+
+	m.RLock()
+	defer m.RUnlock()
+
+	// check the domain exists
+	services, ok := m.records[options.Domain]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+
+	// check the service exists
+	versions, ok := services[name]
+	if !ok || len(versions) == 0 {
+		return nil, registry.ErrNotFound
+	}
+
+	// serialize the response
+	result := make([]*registry.Service, len(versions))
+
+	var i int
+
+	for _, r := range versions {
+		result[i] = recordToService(r, options.Domain)
+		i++
+	}
+
+	return result, nil
+}
+
+func (m *Registry) ListServices(opts ...registry.ListOption) ([]*registry.Service, error) {
+	// parse the options, fallback to the default domain
+	var options registry.ListOptions
+	for _, o := range opts {
+		o(&options)
+	}
+	if len(options.Domain) == 0 {
+		options.Domain = registry.DefaultDomain
+	}
+
+	// if it's a wildcard domain, list from all domains
+	if options.Domain == registry.WildcardDomain {
+		m.RLock()
+		recs := m.records
+		m.RUnlock()
+
+		var services []*registry.Service
+
+		for domain := range recs {
+			srvs, err := m.ListServices(append(opts, registry.ListDomain(domain))...)
+			if err != nil {
+				return nil, err
+			}
+			services = append(services, srvs...)
+		}
+
+		return services, nil
+	}
+
+	m.RLock()
+	defer m.RUnlock()
+
+	// ensure the domain exists
+	services, ok := m.records[options.Domain]
+	if !ok {
+		return make([]*registry.Service, 0), nil
+	}
+
+	// serialize the result, each version counts as an individual service
+	var result []*registry.Service
+
+	for domain, service := range services {
+		for _, version := range service {
+			result = append(result, recordToService(version, domain))
+		}
+	}
+
+	return result, nil
+}
+
 func (m *Registry) Watch(opts ...registry.WatchOption) (registry.Watcher, error) {
+	// parse the options, fallback to the default domain
 	var wo registry.WatchOptions
 	for _, o := range opts {
 		o(&wo)
 	}
+	if len(wo.Domain) == 0 {
+		wo.Domain = registry.DefaultDomain
+	}
 
+	// construct the watcher
 	w := &Watcher{
 		exit: make(chan bool),
 		res:  make(chan *registry.Result),
@@ -323,8 +459,9 @@ func (m *Registry) Watch(opts ...registry.WatchOption) (registry.Watcher, error)
 	}
 
 	m.Lock()
-	m.Watchers[w.id] = w
+	m.watchers[w.id] = w
 	m.Unlock()
+
 	return w, nil
 }
 

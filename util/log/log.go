@@ -1,28 +1,35 @@
 // Package log is a global internal logger
+// DEPRECATED: this is frozen package, use github.com/micro/go-micro/v3/logger
 package log
 
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 
-	"github.com/go-log/log"
-	golog "github.com/go-log/log/log"
+	dlog "github.com/micro/go-micro/v3/debug/log"
+	nlog "github.com/micro/go-micro/v3/logger"
 )
 
 // level is a log level
-type Level int
+type Level int32
 
 const (
 	LevelFatal Level = iota
-	LevelInfo
 	LevelError
+	LevelWarn
+	LevelInfo
 	LevelDebug
 	LevelTrace
 )
 
+type elog struct {
+	dlog dlog.Log
+}
+
 var (
 	// the local logger
-	logger log.Logger = golog.New()
+	logger dlog.Log = &elog{}
 
 	// default log level is info
 	level = LevelInfo
@@ -31,12 +38,32 @@ var (
 	prefix string
 )
 
+func levelToLevel(l Level) nlog.Level {
+	switch l {
+	case LevelTrace:
+		return nlog.TraceLevel
+	case LevelDebug:
+		return nlog.DebugLevel
+	case LevelWarn:
+		return nlog.WarnLevel
+	case LevelInfo:
+		return nlog.InfoLevel
+	case LevelError:
+		return nlog.ErrorLevel
+	case LevelFatal:
+		return nlog.FatalLevel
+	}
+	return nlog.InfoLevel
+}
+
 func init() {
 	switch os.Getenv("MICRO_LOG_LEVEL") {
 	case "trace":
 		level = LevelTrace
 	case "debug":
 		level = LevelDebug
+	case "warn":
+		level = LevelWarn
 	case "info":
 		level = LevelInfo
 	case "error":
@@ -46,21 +73,51 @@ func init() {
 	}
 }
 
-// Log makes use of github.com/go-log/log.Log
-func Log(v ...interface{}) {
-	if len(prefix) > 0 {
-		logger.Log(append([]interface{}{prefix, " "}, v...)...)
-		return
+func (l Level) String() string {
+	switch l {
+	case LevelTrace:
+		return "trace"
+	case LevelDebug:
+		return "debug"
+	case LevelWarn:
+		return "warn"
+	case LevelInfo:
+		return "info"
+	case LevelError:
+		return "error"
+	case LevelFatal:
+		return "fatal"
+	default:
+		return "unknown"
 	}
-	logger.Log(v...)
 }
 
-// Logf makes use of github.com/go-log/log.Logf
+func (el *elog) Read(opt ...dlog.ReadOption) ([]dlog.Record, error) {
+	return el.dlog.Read(opt...)
+}
+
+func (el *elog) Write(r dlog.Record) error {
+	return el.dlog.Write(r)
+}
+
+func (el *elog) Stream() (dlog.Stream, error) {
+	return el.dlog.Stream()
+}
+
+// Log makes use of github.com/micro/debug/log
+func Log(v ...interface{}) {
+	if len(prefix) > 0 {
+		v = append([]interface{}{prefix, " "}, v...)
+	}
+	nlog.DefaultLogger.Log(levelToLevel(level), v)
+}
+
+// Logf makes use of github.com/micro/debug/log
 func Logf(format string, v ...interface{}) {
 	if len(prefix) > 0 {
 		format = prefix + " " + format
 	}
-	logger.Logf(format, v...)
+	nlog.DefaultLogger.Logf(levelToLevel(level), format, v)
 }
 
 // WithLevel logs with the level specified
@@ -99,6 +156,16 @@ func Debugf(format string, v ...interface{}) {
 	WithLevelf(LevelDebug, format, v...)
 }
 
+// Warn provides warn level logging
+func Warn(v ...interface{}) {
+	WithLevel(LevelWarn, v...)
+}
+
+// Warnf provides warn level logging
+func Warnf(format string, v ...interface{}) {
+	WithLevelf(LevelWarn, format, v...)
+}
+
 // Info provides info level logging
 func Info(v ...interface{}) {
 	WithLevel(LevelInfo, v...)
@@ -122,28 +189,27 @@ func Errorf(format string, v ...interface{}) {
 // Fatal logs with Log and then exits with os.Exit(1)
 func Fatal(v ...interface{}) {
 	WithLevel(LevelFatal, v...)
-	os.Exit(1)
 }
 
 // Fatalf logs with Logf and then exits with os.Exit(1)
 func Fatalf(format string, v ...interface{}) {
 	WithLevelf(LevelFatal, format, v...)
-	os.Exit(1)
 }
 
 // SetLogger sets the local logger
-func SetLogger(l log.Logger) {
+func SetLogger(l dlog.Log) {
 	logger = l
 }
 
 // GetLogger returns the local logger
-func GetLogger() log.Logger {
+func GetLogger() dlog.Log {
 	return logger
 }
 
 // SetLevel sets the log level
 func SetLevel(l Level) {
-	level = l
+	atomic.StoreInt32((*int32)(&level), int32(l))
+	nlog.Init(nlog.WithLevel(levelToLevel(l)))
 }
 
 // GetLevel returns the current level
